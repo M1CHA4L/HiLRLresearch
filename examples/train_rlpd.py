@@ -50,6 +50,14 @@ flags.DEFINE_boolean("save_video", False, "Save video.")
 flags.DEFINE_boolean(
     "debug", False, "Debug mode."
 )  # debug mode will disable wandb logging
+flags.DEFINE_integer("port", 5588, "Trainer port (broadcast uses port+1). Use distinct ports for parallel runs.")
+
+# ---- simulation / attention-budget options (only used by configs that define them) ----
+flags.DEFINE_string("human_mode", None, "off | full | alert | expert | spacemouse | ros2")
+flags.DEFINE_string("alert_risk", None, "random | q_std | neg_q (human_mode=alert)")
+flags.DEFINE_float("attention_budget", None, "Target fraction of steps the human attends.")
+flags.DEFINE_boolean("ros2_bridge", None, "Publish sim state/images/attention on ROS2 topics.")
+flags.DEFINE_boolean("realtime", None, "Run the sim env at 10 Hz wall clock like the real robot.")
 
 
 devices = jax.local_devices()
@@ -59,6 +67,27 @@ sharding = jax.sharding.PositionalSharding(devices)
 
 def print_green(x):
     return print("\033[92m {}\033[00m".format(x))
+
+
+def find_wrapper(env, cls_name):
+    """Walk the wrapper chain and return the first wrapper with this class name (or None)."""
+    while env is not None:
+        if type(env).__name__ == cls_name:
+            return env
+        env = getattr(env, "env", None)
+    return None
+
+
+def make_critic_fn(agent):
+    """Jitted Q-ensemble evaluation for a single (unbatched) actor observation -> (ensemble,)."""
+    hybrid = hasattr(agent, "forward_grasp_critic")
+
+    @jax.jit
+    def critic_fn(agent, obs, action, rng):
+        a = action[..., :-1] if hybrid else action  # hybrid agents: critic sees only EE actions
+        return agent.forward_critic(obs, a, rng, train=False)
+
+    return critic_fn
 
 
 ##############################################################################
@@ -123,7 +152,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
     client = TrainerClient(
         "actor_env",
         FLAGS.ip,
-        make_trainer_config(),
+        make_trainer_config(port_number=FLAGS.port, broadcast_port=FLAGS.port + 1),
         data_stores=datastore_dict,
         wait_for_server=True,
         timeout_ms=3000,
@@ -135,6 +164,26 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
         agent = agent.replace(state=agent.state.replace(params=params))
 
     client.recv_network_callback(update_params)
+
+    # ---------------- attention-budget hooks (simulated human, see serl_sim) ----------------
+    human = find_wrapper(env, "SimHumanIntervention")
+    ros2_bridge = find_wrapper(env, "Ros2BridgeWrapper")
+    scheduler = None
+    alert_risk = getattr(config, "alert_risk", "random")
+    if human is not None and human.mode == "alert":
+        from serl_sim.attention import BudgetedAlertScheduler
+
+        scheduler = BudgetedAlertScheduler(
+            budget=config.attention_budget,
+            use_miss_controller=getattr(config, "use_miss_controller", True),
+            seed=FLAGS.seed,
+        )
+        print_green(f"attention-budgeted alerts: risk={alert_risk}, budget={config.attention_budget}")
+    log_risk = getattr(config, "log_risk", human is not None)
+    need_critic = scheduler is not None and alert_risk in ("q_std", "neg_q")
+    critic_fn = make_critic_fn(agent) if (log_risk or need_critic) else None
+    risk_rng = np.random.default_rng(FLAGS.seed)
+    risk_log = []
 
     transitions = []
     demo_transitions = []
@@ -165,6 +214,34 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 )
                 actions = np.asarray(jax.device_get(actions))
 
+        # Risk score + attention alert (decided before the step; the human arrives with a delay)
+        q_mean, q_std, risk, alert = np.nan, np.nan, np.nan, False
+        if critic_fn is not None and step >= config.random_steps:
+            with timer.context("risk"):
+                try:
+                    sampling_rng, q_key = jax.random.split(sampling_rng)
+                    qs = np.asarray(
+                        jax.device_get(critic_fn(agent, jax.device_put(obs), actions, q_key))
+                    ).reshape(-1)
+                    q_mean, q_std = float(qs.mean()), float(qs.std())
+                except Exception as e:
+                    if need_critic:
+                        raise
+                    print(f"[risk logging disabled] critic evaluation failed: {e}")
+                    critic_fn = None
+        if scheduler is not None:
+            if alert_risk == "q_std":
+                risk = q_std
+            elif alert_risk == "neg_q":
+                risk = -q_mean
+            if alert_risk == "random" or np.isnan(risk):
+                risk = risk_rng.random()
+            alert = scheduler.should_alert(risk)
+            if alert:
+                human.request_attention()
+        if ros2_bridge is not None:
+            ros2_bridge.mark_alert(alert)
+
         # Step environment
         with timer.context("step_env"):
 
@@ -183,6 +260,33 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 already_intervened = True
             else:
                 already_intervened = False
+
+            attention = int(info.get("attention", 0))
+            failure_event = bool(info.get("failure", False)) or (
+                (done or truncated) and not bool(info.get("succeed", False))
+            )
+            if scheduler is not None:
+                scheduler.observe(attention, failure_event)
+            if log_risk:
+                risk_log.append(
+                    dict(
+                        step=step,
+                        q_mean=q_mean,
+                        q_std=q_std,
+                        risk=risk,
+                        alert=alert,
+                        tau=scheduler.tau if scheduler is not None else np.nan,
+                        attention=attention,
+                        intervened=already_intervened,
+                        reward=float(reward),
+                        done=bool(done or truncated),
+                        succeed=bool(info.get("succeed", False)),
+                        failure=failure_event,
+                        failure_type=info.get("failure_type", ""),
+                        contact_violation=bool(info.get("contact_violation", False)),
+                        human_state=info.get("human_state", ""),
+                    )
+                )
 
             running_return += reward
             transition = dict(
@@ -205,6 +309,11 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             if done or truncated:
                 info["episode"]["intervention_count"] = intervention_count
                 info["episode"]["intervention_steps"] = intervention_steps
+                if "attention_stats" in info:
+                    info["episode"].update(info.pop("attention_stats"))
+                if scheduler is not None:
+                    info["episode"].update({f"alert_{k}": v for k, v in scheduler.stats().items()})
+                info.pop("original_state_obs", None)  # arrays, not useful in wandb
                 stats = {"environment": info}  # send stats to the learner to log
                 client.request("send-stats", stats)
                 pbar.set_description(f"last return: {running_return}")
@@ -231,6 +340,12 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             ) as f:
                 pkl.dump(demo_transitions, f)
                 demo_transitions = []
+            if risk_log:
+                risk_log_path = os.path.join(FLAGS.checkpoint_path, "risk_log")
+                os.makedirs(risk_log_path, exist_ok=True)
+                with open(os.path.join(risk_log_path, f"risk_{step}.pkl"), "wb") as f:
+                    pkl.dump(risk_log, f)
+                risk_log = []
 
         timer.tock("total")
 
@@ -262,7 +377,10 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
         return {}  # not expecting a response
 
     # Create server
-    server = TrainerServer(make_trainer_config(), request_callback=stats_callback)
+    server = TrainerServer(
+        make_trainer_config(port_number=FLAGS.port, broadcast_port=FLAGS.port + 1),
+        request_callback=stats_callback,
+    )
     server.register_data_store("actor_env", replay_buffer)
     server.register_data_store("actor_env_intvn", demo_buffer)
     server.start(threaded=True)
@@ -368,6 +486,13 @@ def main(_):
     rng, sampling_rng = jax.random.split(rng)
 
     assert FLAGS.exp_name in CONFIG_MAPPING, "Experiment folder not found."
+    # sim / attention overrides from the command line (configs without these fields ignore them)
+    for name in ("human_mode", "alert_risk", "attention_budget", "ros2_bridge", "realtime"):
+        value = getattr(FLAGS, name)
+        if value is not None:
+            setattr(config, name, value)
+    if hasattr(config, "sim_seed"):
+        config.sim_seed = FLAGS.seed
     env = config.get_environment(
         fake_env=FLAGS.learner,
         save_video=FLAGS.save_video,
@@ -385,6 +510,8 @@ def main(_):
             image_keys=config.image_keys,
             encoder_type=config.encoder_type,
             discount=config.discount,
+            critic_ensemble_size=getattr(config, "critic_ensemble_size", 2),
+            critic_subsample_size=getattr(config, "critic_subsample_size", None),
         )
         include_grasp_penalty = False
     elif config.setup_mode == 'single-arm-learned-gripper':
@@ -395,6 +522,8 @@ def main(_):
             image_keys=config.image_keys,
             encoder_type=config.encoder_type,
             discount=config.discount,
+            critic_ensemble_size=getattr(config, "critic_ensemble_size", 2),
+            critic_subsample_size=getattr(config, "critic_subsample_size", None),
         )
         include_grasp_penalty = True
     elif config.setup_mode == 'dual-arm-learned-gripper':
@@ -405,6 +534,8 @@ def main(_):
             image_keys=config.image_keys,
             encoder_type=config.encoder_type,
             discount=config.discount,
+            critic_ensemble_size=getattr(config, "critic_ensemble_size", 2),
+            critic_subsample_size=getattr(config, "critic_subsample_size", None),
         )
         include_grasp_penalty = True
     else:

@@ -1,0 +1,147 @@
+<!--
+  UR7e (UR5e kinematics: d1=0.1625, a2=0.425, a3=0.3922, d4=0.1333, d5=0.0997, d6=0.0996)
+  + simplified parallel-jaw gripper (Robotiq 2F-85-like stroke) + pick-and-place scene.
+
+  Geometry is primitive-only so the scene has no external mesh dependency. Arm link geoms are
+  visual-only (no self/table collision); the safety box in the env keeps the TCP above the table.
+  Joint torques are commanded by the Cartesian impedance controller in ur7e_pick_place_env.py.
+-->
+<mujoco model="ur7e_pick_place">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002" integrator="implicitfast" cone="elliptic" impratio="10"/>
+
+  <visual>
+    <global offwidth="640" offheight="480"/>
+    <quality shadowsize="2048"/>
+    <headlight ambient="0.35 0.35 0.35" diffuse="0.5 0.5 0.5"/>
+  </visual>
+
+  <default>
+    <default class="arm_vis">
+      <geom contype="0" conaffinity="0" group="1" rgba="0.72 0.74 0.78 1"/>
+    </default>
+    <default class="arm_joint">
+      <joint armature="0.1" damping="2.0" range="-6.2832 6.2832"/>
+    </default>
+    <default class="grip">
+      <geom contype="1" conaffinity="1" condim="4" friction="1.5 0.02 0.002"
+            solref="0.004 1" solimp="0.95 0.99 0.001" rgba="0.15 0.15 0.15 1"/>
+    </default>
+  </default>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.25 0.27 0.30" rgb2="0.20 0.22 0.25"/>
+    <material name="grid" texture="grid" texrepeat="6 6" reflectance="0.05"/>
+    <material name="table" rgba="0.62 0.55 0.46 1"/>
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.6 0.7 0.8" rgb2="0.1 0.1 0.15"
+             width="256" height="256"/>
+  </asset>
+
+  <worldbody>
+    <light name="key" pos="0.6 -0.4 1.6" dir="-0.2 0.2 -1" diffuse="0.7 0.7 0.7" castshadow="true"/>
+    <geom name="floor" type="plane" pos="0 0 -0.75" size="3 3 0.1" material="grid"
+          contype="0" conaffinity="0"/>
+    <geom name="table" type="box" pos="0.5 0 -0.025" size="0.35 0.45 0.025" material="table"
+          contype="1" conaffinity="1" friction="0.8 0.01 0.001"/>
+    <geom name="pedestal" type="cylinder" pos="0 0 -0.02" size="0.09 0.02" rgba="0.3 0.3 0.32 1"
+          contype="0" conaffinity="0"/>
+
+    <!-- place target (visual only); position is overwritten by the env at reset -->
+    <body name="target" pos="0.45 0.15 0">
+      <geom name="target_pad" type="cylinder" size="0.04 0.0006" pos="0 0 0.0006"
+            rgba="0.2 0.75 0.3 0.9" contype="0" conaffinity="0"/>
+    </body>
+
+    <body name="ws_center" pos="0.45 0 0.06"/>
+    <camera name="front" pos="1.0 0.0 0.62" mode="targetbody" target="ws_center" fovy="58"/>
+
+    <!-- ===================== UR7e arm ===================== -->
+    <body name="base" pos="0 0 0" quat="0 0 0 1">
+      <geom class="arm_vis" type="cylinder" size="0.075 0.045" pos="0 0 0.045" rgba="0.2 0.2 0.22 1"/>
+      <body name="shoulder_link" pos="0 0 0.1625">
+        <inertial pos="0 0 0" mass="3.761" diaginertia="0.0103 0.0103 0.0067"/>
+        <joint name="shoulder_pan_joint" class="arm_joint" axis="0 0 1"/>
+        <geom class="arm_vis" type="cylinder" size="0.06 0.06" pos="0 0 -0.02" rgba="0.3 0.45 0.7 1"/>
+        <geom class="arm_vis" type="cylinder" fromto="0 -0.01 0 0 0.14 0" size="0.06"/>
+        <body name="upper_arm_link" pos="0 0.138 0" quat="1 0 1 0">
+          <inertial pos="0 0 0.2125" mass="8.058" diaginertia="0.1339 0.1339 0.0151"/>
+          <joint name="shoulder_lift_joint" class="arm_joint" axis="0 1 0"/>
+          <geom class="arm_vis" type="capsule" fromto="0 0 0 0 0 0.425" size="0.05"/>
+          <body name="forearm_link" pos="0 -0.131 0.425">
+            <inertial pos="0 0 0.196" mass="2.846" diaginertia="0.0312 0.0312 0.0041"/>
+            <joint name="elbow_joint" class="arm_joint" axis="0 1 0" range="-3.1416 3.1416"/>
+            <geom class="arm_vis" type="cylinder" fromto="0 -0.01 0 0 0.13 0" size="0.05" rgba="0.3 0.45 0.7 1"/>
+            <geom class="arm_vis" type="capsule" fromto="0 0 0 0 0 0.392" size="0.04"/>
+            <body name="wrist_1_link" pos="0 0 0.3922" quat="1 0 1 0">
+              <inertial pos="0 0.127 0" mass="1.37" diaginertia="0.0026 0.0026 0.0022"/>
+              <joint name="wrist_1_joint" class="arm_joint" axis="0 1 0"/>
+              <geom class="arm_vis" type="cylinder" fromto="0 -0.02 0 0 0.127 0" size="0.04" rgba="0.3 0.45 0.7 1"/>
+              <body name="wrist_2_link" pos="0 0.127 0">
+                <inertial pos="0 0 0.1" mass="1.3" diaginertia="0.0026 0.0026 0.0022"/>
+                <joint name="wrist_2_joint" class="arm_joint" axis="0 0 1"/>
+                <geom class="arm_vis" type="cylinder" fromto="0 0 -0.03 0 0 0.1" size="0.04"/>
+                <body name="wrist_3_link" pos="0 0 0.0997">
+                  <inertial pos="0 0.0771 0" mass="0.365" diaginertia="0.001 0.0009 0.0009"/>
+                  <joint name="wrist_3_joint" class="arm_joint" axis="0 1 0"/>
+                  <geom class="arm_vis" type="cylinder" fromto="0 0 0 0 0.0996 0" size="0.038" rgba="0.3 0.45 0.7 1"/>
+
+                  <!-- ============ gripper (z = approach direction) ============ -->
+                  <body name="gripper_base" pos="0 0.0996 0" quat="-1 1 0 0">
+                    <inertial pos="0 0 0.03" mass="0.6" diaginertia="0.0008 0.0008 0.0006"/>
+                    <site name="ft_site" pos="0 0 0" size="0.005" rgba="1 0 0 0"/>
+                    <geom name="palm" class="grip" type="box" size="0.045 0.03 0.02" pos="0 0 0.02"/>
+                    <geom name="coupler" class="arm_vis" type="cylinder" size="0.038 0.004" pos="0 0 0.002"
+                          rgba="0.1 0.1 0.1 1"/>
+                    <site name="tcp" pos="0 0 0.09" size="0.006" rgba="1 0.5 0 0.5" group="3"/>
+                    <camera name="wrist" pos="0.08 0 0.03" xyaxes="0 1 0 0.94 0 0.34" fovy="70"/>
+
+                    <body name="left_finger" pos="0 0 0.04">
+                      <inertial pos="0 0.005 0.03" mass="0.05" diaginertia="2e-5 2e-5 1e-5"/>
+                      <joint name="left_finger_joint" type="slide" axis="0 1 0" range="0 0.04"
+                             damping="3" armature="0.01"/>
+                      <geom name="left_pad" class="grip" type="box" size="0.011 0.005 0.03" pos="0 0.005 0.03"/>
+                    </body>
+                    <body name="right_finger" pos="0 0 0.04">
+                      <inertial pos="0 -0.005 0.03" mass="0.05" diaginertia="2e-5 2e-5 1e-5"/>
+                      <joint name="right_finger_joint" type="slide" axis="0 -1 0" range="0 0.04"
+                             damping="3" armature="0.01"/>
+                      <geom name="right_pad" class="grip" type="box" size="0.011 0.005 0.03" pos="0 -0.005 0.03"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- ===================== object ===================== -->
+    <body name="cube" pos="0.45 -0.1 0.02">
+      <freejoint name="cube_joint"/>
+      <geom name="cube" type="box" size="0.02 0.02 0.02" mass="0.05" rgba="0.85 0.15 0.15 1"
+            condim="4" friction="1.2 0.02 0.002" solref="0.004 1"/>
+    </body>
+  </worldbody>
+
+  <contact>
+    <exclude body1="left_finger" body2="right_finger"/>
+  </contact>
+
+  <equality>
+    <joint joint1="right_finger_joint" joint2="left_finger_joint" polycoef="0 1 0 0 0"
+           solref="0.005 1"/>
+  </equality>
+
+  <actuator>
+    <motor name="shoulder_pan" joint="shoulder_pan_joint" ctrlrange="-150 150"/>
+    <motor name="shoulder_lift" joint="shoulder_lift_joint" ctrlrange="-150 150"/>
+    <motor name="elbow" joint="elbow_joint" ctrlrange="-150 150"/>
+    <motor name="wrist_1" joint="wrist_1_joint" ctrlrange="-28 28"/>
+    <motor name="wrist_2" joint="wrist_2_joint" ctrlrange="-28 28"/>
+    <motor name="wrist_3" joint="wrist_3_joint" ctrlrange="-28 28"/>
+    <position name="gripper" joint="left_finger_joint" kp="1500" ctrlrange="0 0.04"
+              forcerange="-25 25"/>
+  </actuator>
+</mujoco>
